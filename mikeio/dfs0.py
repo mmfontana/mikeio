@@ -1,8 +1,9 @@
 import os
-from datetime import datetime, timedelta
-
+import warnings
 import numpy as np
 import pandas as pd
+from datetime import datetime, timedelta
+
 from DHI.Generic.MikeZero import eumQuantity
 from DHI.Generic.MikeZero.DFS import (
     DfsFileFactory,
@@ -15,36 +16,93 @@ from DHI.Generic.MikeZero.DFS import (
 from DHI.Generic.MikeZero.DFS.dfs0 import Dfs0Util
 
 from .dotnet import to_dotnet_array, to_dotnet_datetime, from_dotnet_datetime
-from .dutil import Dataset, find_item
+from .dutil import Dataset, get_valid_items_and_timesteps
 from .eum import TimeStep, EUMType, EUMUnit, ItemInfo
 from .helpers import safe_length
 
 
 class Dfs0:
-    def __read(self, filename):
+
+    _start_time = None
+    _n_items = None
+    _dt = None
+    _is_equidistant = None
+    _title = None
+    _data_value_type = None
+    _items = None
+
+    def __init__(self, filename=None):
+        """Create a Dfs0 object for reading, writing
+
+        Parameters
+        ----------
+        filename: str, optional
+            File name including full path to the dfs0 file.
+        """
+        self._filename = filename
+
+    def read(self, items=None, time_steps=None):
         """
         Read data from a dfs0 file.
-        """
-        if not os.path.exists(filename):
-            raise FileNotFoundError(f"File {filename} not found.")
 
-        self._dfs = DfsFileFactory.DfsGenericOpen(filename)
-        self._n_items = safe_length(self._dfs.ItemInfo)
-        self._n_timesteps = self._dfs.FileInfo.TimeAxis.NumberOfTimeSteps
+        Parameters
+        ----------
+        items: list[int] or list[str], optional
+            Read only selected items, by number (0-based), or by name
+        time_steps: int or list[int], optional
+            Read only selected time_steps
+
+        Returns
+        -------
+        Dataset
+            A dataset with data dimensions [t]
+        """
+
+        if not os.path.exists(self._filename):
+            raise FileNotFoundError(f"File {self._filename} not found.")
+
+        dfs = DfsFileFactory.DfsGenericOpen(self._filename)
+        self._source = dfs
+        self._n_items = safe_length(dfs.ItemInfo)
+        self._n_timesteps = dfs.FileInfo.TimeAxis.NumberOfTimeSteps
+
+        items, item_numbers, _ = get_valid_items_and_timesteps(self, items, time_steps)
+
+        dfs.Close()
+
+        ds = self.__read(self._filename)
+        ds = ds[item_numbers]
+        if time_steps:
+            ds = ds.isel(time_steps, axis=0)
+
+        return ds
+
+    def __read(self, filename):
+        """
+        Read all data from a dfs0 file.
+        """
         self._time_column_index = 0  # First column is time (the rest is data)
 
+        self._dfs = DfsFileFactory.DfsGenericOpen(filename)
         raw_data = Dfs0Util.ReadDfs0DataDouble(self._dfs)  # Bulk read the data
 
-        data = self.__to_numpy_with_nans(raw_data)
+        matrix = self.__to_numpy_with_nans(raw_data)
+
+        data = []
+        for i in range(matrix.shape[1]):
+            data.append(matrix[:, i])
+
         time = list(self.__get_time(raw_data))
         items = list(self.__get_items())
 
         self._dfs.Close()
 
-        return data, time, items
+        return Dataset(data, time, items)
 
     def __to_numpy_with_nans(self, raw_data):
-        data = np.fromiter(raw_data, np.float64).reshape(self._n_timesteps, self._n_items + 1)[:, 1::]
+        data = np.fromiter(raw_data, np.float64).reshape(
+            self._n_timesteps, self._n_items + 1
+        )[:, 1::]
         nan_indices = np.isclose(data, self._dfs.FileInfo.DeleteValueFloat, atol=1e-36)
         data[nan_indices] = np.nan
         return data
@@ -63,108 +121,110 @@ class Dfs0:
             unit = EUMUnit(self._dfs.ItemInfo[i].Quantity.Unit)
             yield ItemInfo(name, item_type, unit)
 
-    def read(self, filename, item_numbers=None, item_names=None):
-        """
-        Read data from a dfs0 file.
+    @staticmethod
+    def _validate_item_numbers(item_numbers):
+        if not all(
+            isinstance(item_number, int) and 0 <= item_number < 1e15
+            for item_number in item_numbers
+        ):
+            raise Warning(
+                "item_numbers must be a list or array of values between 0 and 1e15"
+            )
 
-        Parameters
-        ----------
-        filename: str
-            File name including full path to the dfs0 file.
-        item_numbers: list[int], optional
-            Rread only the item_numbers in the array specified (0 base)
-        item_names: list[str], optional
-            Read only the items in the array specified, (takes precedence over item_numbers)
-
-        Returns
-        -------
-            Dataset(data, time, items)
-        """
-
-        data, time, items = self.__read(filename)
-
-        if item_names is not None:
-            item_numbers = find_item(self._dfs, item_names)
-
-        selected_item_numbers = range(data.shape[1]) if item_numbers is None else item_numbers
-
-        self._validate_item_numbers(selected_item_numbers)
-
-        selected_data = []
-        selected_items = []
-        for item_number in selected_item_numbers:
-            selected_data.append(data[:, item_number])
-            selected_items.append(items[item_number])
-
-        return Dataset(selected_data, time, selected_items)
-
-    def _validate_item_numbers(self, item_numbers):
-        if not all(isinstance(item_number, int) and 0 <= item_number < 1e15 for item_number in item_numbers):
-            raise Warning("item_numbers must be a list or array of values between 0 and 1e15")
-
-    def write(self, filename, data):
-
-        """
-        Overwrites an existing dfs0 file.
-
-        Parameters
-        ----------
-        filename: str
-            Full path and filename to dfs0 to be modified.
-        data: list[np.array]
-            Data to overwrite.
-        """
-
+    @staticmethod
+    def _validate_and_open_dfs(filename, data):
         if not os.path.exists(filename):
             raise FileNotFoundError(f"File {filename} not found.")
 
         try:
             dfs = DfsFileFactory.DfsGenericOpenEdit(filename)
         except IOError:
-            print("cannot open", filename)
-
-        delete_value = dfs.FileInfo.DeleteValueFloat
+            raise IOError(f"Cannot open {filename}.")
 
         n_items = len(dfs.ItemInfo)
         n_time_steps = dfs.FileInfo.TimeAxis.NumberOfTimeSteps
 
-        # Makes sure the data to write to the file matches the dfs0 file
+        # Match the data to write to the existing dfs0 file
         if n_time_steps != data[0].shape[0]:
             raise Exception(
-                f"Inconsistent data size. nt (row count) must be size {n_time_steps}"
+                f"Inconsistent data size. Number of time steps (row count) is {data[0].shape[0]}. Expected {n_time_steps}."
             )
 
         if n_items != len(data):
-            raise Exception(f"Number of items must be size {n_items}")
+            raise Exception(f"The number of items is {len(data)}. Expected {n_items}.")
 
-        for i in range(n_items):
-            d = data[i]
+        return dfs, n_items, n_time_steps
 
-            d[np.isnan(d)] = delete_value
+    @staticmethod
+    def _to_dfs_datatype(dtype):
+        if dtype is None:
+            return DfsSimpleType.Float
 
-        # Get the date times in seconds (from start)
-        dfsdata = Dfs0Util.ReadDfs0DataDouble(dfs)
-        t_seconds = [dfsdata[i, 0] for i in range(n_time_steps)]
+        if dtype in (np.float64, DfsSimpleType.Double, "double"):
+            return DfsSimpleType.Double
 
-        dfs.Reset()
+        if dtype in (np.float32, DfsSimpleType.Float, "float", "single"):
+            return DfsSimpleType.Float
 
-        data1 = np.stack(data, axis=1)
-        Dfs0Util.WriteDfs0DataDouble(dfs, t_seconds, to_dotnet_array(data1))
+        raise ValueError("Invalid data type. Choose np.float32 or np.float64")
 
-        dfs.Close()
+    def _setup_header(self):
+        factory = DfsFactory()
+        builder = DfsBuilder.Create(self._title, "DFS", 0)
+        builder.SetDataType(1)
+        builder.SetGeographicalProjection(factory.CreateProjectionUndefined())
 
-    def create(
-            self,
-            filename,
-            data,
-            start_time=None,
-            timeseries_unit=TimeStep.SECOND,
-            dt=1.0,
-            datetimes=None,
-            items=None,
-            title=None,
-            data_value_type=None,
-            dtype=None,
+        system_start_time = to_dotnet_datetime(self._start_time)
+
+        if self._is_equidistant:
+            temporal_axis = factory.CreateTemporalEqCalendarAxis(
+                self._timeseries_unit, system_start_time, 0, self._dt
+            )
+        else:
+            temporal_axis = factory.CreateTemporalNonEqCalendarAxis(
+                self._timeseries_unit, system_start_time
+            )
+
+        builder.SetTemporalAxis(temporal_axis)
+        builder.SetItemStatisticsType(StatType.RegularStat)
+
+        dtype_dfs = self._to_dfs_datatype(self._dtype)
+
+        for i in range(self._n_items):
+            item = self._items[i]
+            newitem = builder.CreateDynamicItemBuilder()
+            quantity = eumQuantity.Create(item.type, item.unit)
+            newitem.Set(
+                item.name, quantity, dtype_dfs,
+            )
+
+            if self._data_value_type is not None:
+                newitem.SetValueType(self._data_value_type[i])
+            else:
+                newitem.SetValueType(DataValueType.Instantaneous)
+
+            newitem.SetAxis(factory.CreateAxisEqD0())
+            builder.AddDynamicItem(newitem.GetDynamicItemInfo())
+
+        try:
+            builder.CreateFile(self._filename)
+        except IOError:
+            raise IOError(f"Cannot create dfs0 file: {self._filename}")
+
+        return builder.GetFile()
+
+    def write(
+        self,
+        filename,
+        data,
+        start_time=None,
+        timeseries_unit=TimeStep.SECOND,
+        dt=None,
+        datetimes=None,
+        items=None,
+        title="",
+        data_value_type=None,
+        dtype=None,
     ):
         """
         Create a dfs0 file.
@@ -186,143 +246,106 @@ class Dfs0:
         items: list[ItemInfo], optional
             List of ItemInfo corresponding to a variable types (ie. Water Level).
         title: str, optional
-            title
+            title, default blank
         data_value_type: list[DataValueType], optional
             DataValueType default DataValueType.INSTANTANEOUS
         dtype : np.dtype, optional
             default np.float32
 
         """
-        if title is None:
-            title = "dfs0 file"
+        self._filename = filename
+        self._title = title
+        self._timeseries_unit = timeseries_unit
+        self._dtype = dtype
+        self._data_value_type = data_value_type
 
-        n_items = len(data)
-        n_time_steps = np.shape(data[0])[0]
+        if isinstance(data, Dataset):
+            self._items = data.items
 
-        if start_time is None:
-            start_time = datetime.now()
+            if data.is_equidistant:
+                self._start_time = data.time[0]
+                self._dt = (data.time[1] - data.time[0]).total_seconds()
+            else:
+                datetimes = data.time
+            data = data.data
 
-        if items is None:
-            items = [ItemInfo(f"temItem {i + 1}") for i in range(n_items)]
+        if dt:
+            self._dt = dt
 
-        if len(items) != n_items:
-            raise Warning(
+        if self._dt is None:
+            self._dt = 1.0
+
+        if start_time:
+            self._start_time = start_time
+
+        self._n_items = len(data)
+        self._n_time_steps = np.shape(data[0])[0]
+
+        if items:
+            self._items = items
+
+        if self._items is None:
+            warnings.warn("No items info supplied. Using Item 1, 2, 3,...")
+            self._items = [ItemInfo(f"Item {i + 1}") for i in range(self._n_items)]
+
+        if len(self._items) != self._n_items:
+            raise ValueError(
                 "names must be an array of strings with the same number of elements as data columns"
             )
 
-        if datetimes is None:
-            equidistant = True
+        if datetimes is not None:
+            self._start_time = datetimes[0]
+            self._is_equidistant = False
+        else:
+            self._is_equidistant = True
+            if self._start_time is None:
+                self._start_time = datetime.now()
+                warnings.warn(
+                    f"No start time supplied. Using current time: {self._start_time} as start time."
+                )
 
-            if not type(start_time) is datetime:
-                raise Warning("start_time must be of type datetime ")
-
-            dt = np.float(dt)
+            self._dt = np.float(self._dt)
             datetimes = np.array(
                 [
-                    start_time + timedelta(seconds=(step * dt))
-                    for step in np.arange(n_time_steps)
+                    self._start_time + timedelta(seconds=(step * self._dt))
+                    for step in np.arange(self._n_time_steps)
                 ]
             )
 
-        else:
-            start_time = datetimes[0]
-            equidistant = False
+        dfs = self._setup_header()
 
-        if dtype in (np.float64, DfsSimpleType.Double, "double"):
-            dtype = DfsSimpleType.Double
-        elif dtype in (np.float32, DfsSimpleType.Float, "float", "single"):
-            dtype = DfsSimpleType.Float
-        elif dtype is None:
-            dtype = DfsSimpleType.Float
-        else:
-            raise ValueError(
-                "Invalid data type, choose between np.float32 or np.float64"
-            )
-
-        # if not isinstance(timeseries_unit, int):
-        #    raise Warning("timeseries_unit must be an integer. See dfsutil options for help ")
-
-        system_start_time = to_dotnet_datetime(start_time)
-
-        factory = DfsFactory()
-        builder = DfsBuilder.Create(title, "DFS", 0)
-        builder.SetDataType(1)
-        builder.SetGeographicalProjection(factory.CreateProjectionUndefined())
-
-        if equidistant:
-            builder.SetTemporalAxis(
-                factory.CreateTemporalEqCalendarAxis(
-                    timeseries_unit, system_start_time, 0, dt
-                )
-            )
-        else:
-            builder.SetTemporalAxis(
-                factory.CreateTemporalNonEqCalendarAxis(
-                    timeseries_unit, system_start_time
-                )
-            )
-
-        builder.SetItemStatisticsType(StatType.RegularStat)
-
-        for i in range(n_items):
-
-            item = builder.CreateDynamicItemBuilder()
-
-            item.Set(
-                items[i].name, eumQuantity.Create(items[i].type, items[i].unit), dtype,
-            )
-
-            if data_value_type is not None:
-                item.SetValueType(data_value_type[i])
-            else:
-                item.SetValueType(DataValueType.Instantaneous)
-
-            item.SetAxis(factory.CreateAxisEqD0())
-            builder.AddDynamicItem(item.GetDynamicItemInfo())
-
-        try:
-            builder.CreateFile(filename)
-
-        except IOError:
-            print("cannot create dfso file: ", filename)
-
-        dfs = builder.GetFile()
         delete_value = dfs.FileInfo.DeleteValueFloat
 
-        for i in range(n_items):
-            d = data[i]
-            d[np.isnan(d)] = delete_value
-
-        data1 = np.stack(data, axis=1)
+        data = np.array(data)
+        data[np.isnan(data)] = delete_value
+        data_to_write = to_dotnet_array(data.T)
         t_seconds = [(t - datetimes[0]).total_seconds() for t in datetimes]
-        Dfs0Util.WriteDfs0DataDouble(dfs, t_seconds, to_dotnet_array(data1))
+        Dfs0Util.WriteDfs0DataDouble(dfs, t_seconds, data_to_write)
 
         dfs.Close()
 
-    def to_dataframe(self, filename, unit_in_name=False):
+    def to_dataframe(self, unit_in_name=False, round_time="s"):
         """
         Read data from the dfs0 file and return a Pandas DataFrame.
         
         Parameters
         ----------
-        filename: str
-            full path and file name to the dfs0 file.
         unit_in_name: bool, optional
             include unit in column name, default False
+        round_time: string, bool, optional
+            round time to avoid problem with floating point inaccurcy, set to False to avoid rounding
         Returns
         -------
         pd.DataFrame
         """
-        data, t, items = self.__read(filename)
+        ds = self.read()
+        df = ds.to_dataframe(unit_in_name)
 
-        if unit_in_name:
-            names = [f"{item.name} ({item.unit.name})" for item in items]
+        if round_time:
+            rounded_idx = pd.DatetimeIndex(ds.time).round(round_time)
+            df.index = pd.DatetimeIndex(rounded_idx, freq="infer")
         else:
-            names = [item.name for item in items]
-
-        df = pd.DataFrame(data, columns=names)
-
-        df.index = pd.DatetimeIndex(t, freq="infer")
+            df.index = pd.DatetimeIndex(ds.time, freq="infer")
 
         return df
 
@@ -349,14 +372,14 @@ class Dfs0:
 
 
 def dataframe_to_dfs0(
-        self,
-        filename,
-        itemtype=None,
-        unit=None,
-        items=None,
-        title=None,
-        data_value_type=None,
-        dtype=None,
+    self,
+    filename,
+    itemtype=None,
+    unit=None,
+    items=None,
+    title=None,
+    data_value_type=None,
+    dtype=None,
 ):
     """
     Create a dfs0
@@ -401,7 +424,7 @@ def dataframe_to_dfs0(
                 items = [ItemInfo(name, itemtype, unit) for name in self.columns]
 
     if self.index.freq is None:  # non-equidistant
-        dfs.create(
+        dfs.write(
             filename=filename,
             data=data,
             datetimes=self.index,
@@ -413,13 +436,15 @@ def dataframe_to_dfs0(
     else:  # equidistant
         dt = self.index.freq.delta.total_seconds()
         start_time = self.index[0].to_pydatetime()
-        dfs.create(
+        dfs.write(
             filename=filename,
             data=data,
             start_time=start_time,
             dt=dt,
             items=items,
             title=title,
+            data_value_type=data_value_type,
+            dtype=dtype,
         )
 
 

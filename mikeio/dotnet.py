@@ -46,7 +46,6 @@ def from_dotnet_datetime(x):
 def asNumpyArray(x):
     """
     Convert .NET array to numpy array
-
     Parameters
     ----------
     x : System.Array
@@ -103,16 +102,12 @@ def to_dotnet_array(x):
     dims = x.shape
     dtype = x.dtype
 
-    netDims = System.Array.CreateInstance(System.Int32, x.ndim)
-    for I in range(x.ndim):
-        netDims[I] = System.Int32(dims[I])
-
     if not x.flags.c_contiguous:
         x = x.copy(order="C")
     assert x.flags.c_contiguous
 
     try:
-        netArray = System.Array.CreateInstance(_MAP_NP_NET[dtype], netDims)
+        netArray = System.Array.CreateInstance(_MAP_NP_NET[dtype], dims)
     except KeyError:
         raise NotImplementedError(
             "asNetArray does not yet support dtype {}".format(dtype)
@@ -127,6 +122,15 @@ def to_dotnet_array(x):
         if destHandle.IsAllocated:
             destHandle.Free()
     return netArray
+
+
+def asnetarray_v2(x):
+    if any([type(xi) is list for xi in x]):
+        # Array of array
+        return asnetarray_v2([asnetarray_v2(xi) for xi in x])
+    else:
+        # Array
+        return System.Array[type(x[1])](x)
 
 
 def to_dotnet_float_array(x):

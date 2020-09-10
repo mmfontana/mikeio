@@ -1,9 +1,11 @@
 import os
+import numpy as np
 from datetime import datetime, timedelta
 
 from DHI.Generic.MikeZero.DFS import DfsFileFactory, DfsBuilder
 from .dotnet import to_numpy, to_dotnet_float_array, from_dotnet_datetime
 from .helpers import safe_length
+from .dutil import find_item
 from shutil import copyfile
 
 
@@ -23,25 +25,25 @@ def _clone(infilename, outfilename):
         MIKE generic dfs file object
     """
     source = DfsFileFactory.DfsGenericOpen(infilename)
-    fileInfo = source.FileInfo
+    fi = source.FileInfo
 
     builder = DfsBuilder.Create(
-        fileInfo.FileTitle, fileInfo.ApplicationTitle, fileInfo.ApplicationVersion
+        fi.FileTitle, fi.ApplicationTitle, fi.ApplicationVersion
     )
 
     # Set up the header
-    builder.SetDataType(fileInfo.DataType)
-    builder.SetGeographicalProjection(fileInfo.Projection)
-    builder.SetTemporalAxis(fileInfo.TimeAxis)
-    builder.SetItemStatisticsType(fileInfo.StatsType)
-    builder.DeleteValueByte = fileInfo.DeleteValueByte
-    builder.DeleteValueDouble = fileInfo.DeleteValueDouble
-    builder.DeleteValueFloat = fileInfo.DeleteValueFloat
-    builder.DeleteValueInt = fileInfo.DeleteValueInt
-    builder.DeleteValueUnsignedInt = fileInfo.DeleteValueUnsignedInt
+    builder.SetDataType(fi.DataType)
+    builder.SetGeographicalProjection(fi.Projection)
+    builder.SetTemporalAxis(fi.TimeAxis)
+    builder.SetItemStatisticsType(fi.StatsType)
+    builder.DeleteValueByte = fi.DeleteValueByte
+    builder.DeleteValueDouble = fi.DeleteValueDouble
+    builder.DeleteValueFloat = fi.DeleteValueFloat
+    builder.DeleteValueInt = fi.DeleteValueInt
+    builder.DeleteValueUnsignedInt = fi.DeleteValueUnsignedInt
 
     # Copy custom blocks - if any
-    for customBlock in fileInfo.CustomBlocks:
+    for customBlock in fi.CustomBlocks:
         builder.AddCustomBlock(customBlock)
 
     # Copy dynamic items
@@ -61,10 +63,14 @@ def _clone(infilename, outfilename):
     # Get the file
     file = builder.GetFile()
 
+    source.Close()
+
     return file
 
 
-def scale(infilename, outfilename, offset=0.0, factor=1.0):
+def scale(
+    infilename, outfilename, offset=0.0, factor=1.0, item_numbers=None, item_names=None
+):
     """Apply scaling to any dfs file
 
         Parameters
@@ -78,26 +84,42 @@ def scale(infilename, outfilename, offset=0.0, factor=1.0):
             value to add to all items, default 0.0
         factor: float, optional
             value to multiply to all items, default 1.0
+        item_numbers: list[int], optional
+            Process only selected items, by number (0-based)
+        item_names: list[str], optional
+            Process only selected items, by name, takes precedence over item_numbers
         """
-
     copyfile(infilename, outfilename)
-
     dfs = DfsFileFactory.DfsGenericOpenEdit(outfilename)
 
+    if item_names is not None:
+        item_numbers = find_item(dfs, item_names)
+
+    if item_numbers is None:
+        n_items = safe_length(dfs.ItemInfo)
+        item_numbers = list(range(n_items))
+
     n_time_steps = dfs.FileInfo.TimeAxis.NumberOfTimeSteps
-    n_items = safe_length(dfs.ItemInfo)
+    n_items = len(item_numbers)
+
+    deletevalue = dfs.FileInfo.DeleteValueFloat
 
     for timestep in range(n_time_steps):
         for item in range(n_items):
 
-            itemdata = dfs.ReadItemTimeStep(item + 1, timestep)
-            d = to_numpy(itemdata.Data)
+            itemdata = dfs.ReadItemTimeStep(item_numbers[item] + 1, timestep)
             time = itemdata.Time
+            d = to_numpy(itemdata.Data)
+            d[d == deletevalue] = np.nan
 
             outdata = d * factor + offset
+
+            outdata[np.isnan(outdata)] = deletevalue
             darray = to_dotnet_float_array(outdata)
 
-            dfs.WriteItemTimeStep(item + 1, timestep, time, darray)
+            dfs.WriteItemTimeStep(item_numbers[item] + 1, timestep, time, darray)
+
+    dfs.Close()
 
 
 def sum(infilename_a, infilename_b, outfilename):
@@ -211,13 +233,17 @@ def concat(infilenames, outfilename):
     dfs_o = _clone(infilenames[0], outfilename)
 
     n_items = safe_length(dfs_i_a.ItemInfo)
+    dfs_i_a.Close()
+
+    current_time = datetime(1, 1, 1)  # beginning of time...
 
     for i, infilename in enumerate(infilenames):
 
         dfs_i = DfsFileFactory.DfsGenericOpen(infilename)
-        n_time_steps = dfs_i.FileInfo.TimeAxis.NumberOfTimeSteps
-        dt = dfs_i.FileInfo.TimeAxis.TimeStep
-        start_time = from_dotnet_datetime(dfs_i.FileInfo.TimeAxis.StartDateTime)
+        t_axis = dfs_i.FileInfo.TimeAxis
+        n_time_steps = t_axis.NumberOfTimeSteps
+        dt = t_axis.TimeStep
+        start_time = from_dotnet_datetime(t_axis.StartDateTime)
 
         if i > 0 and start_time > current_time + timedelta(seconds=dt):
             dfs_o.Close()
@@ -232,6 +258,7 @@ def concat(infilenames, outfilename):
             next_start_time = datetime(
                 nf.Year, nf.Month, nf.Day, nf.Hour, nf.Minute, nf.Second
             )
+            dfs_n.Close()
 
         for timestep in range(n_time_steps):
 
@@ -248,5 +275,6 @@ def concat(infilenames, outfilename):
                 darray = to_dotnet_float_array(d)
 
                 dfs_o.WriteItemTimeStepNext(0, darray)
+        dfs_i.Close()
 
     dfs_o.Close()
